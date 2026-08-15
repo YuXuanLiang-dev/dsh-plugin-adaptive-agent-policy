@@ -139,14 +139,6 @@ npm login
 npm publish --tag next
 ```
 
-发布前还应完成：
-
-1. 在 `package.json` 中加入你创建后的 GitHub `repository`、`bugs` 和 `homepage` 地址；
-2. 再次执行 `npm view dsh-plugin-adaptive-agent-policy` 检查包名；
-3. 在干净的 DSH `0.1.0-rc.6` 安装中运行一次真实任务冒烟测试；
-4. 确认 `npm pack --dry-run` 仅包含 `dist`、README、许可证与来源声明；
-5. 首次发布后给 GitHub 仓库添加 `dsh-plugin` topic。
-
 ## 已知边界
 
 - 文本路由可能保守地误判含糊任务；它有意不增加路由模型调用。

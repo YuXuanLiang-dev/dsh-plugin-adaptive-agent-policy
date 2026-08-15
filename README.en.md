@@ -149,14 +149,6 @@ npm login
 npm publish --tag next
 ```
 
-Before publication:
-
-1. Add the created GitHub `repository`, `bugs`, and `homepage` URLs to `package.json`.
-2. Re-run `npm view dsh-plugin-adaptive-agent-policy` to confirm name availability.
-3. Run one real-task smoke test against a clean DSH `0.1.0-rc.6` installation.
-4. Confirm that `npm pack --dry-run` contains only `dist`, READMEs, the license, and provenance notice.
-5. Add the `dsh-plugin` topic to the GitHub repository after its first release.
-
 ## Known limits
 
 - Text routing can conservatively misclassify ambiguous tasks; it deliberately avoids a routing model call.
