@@ -6,7 +6,7 @@ An unofficial standalone DeepSeek Harness plugin that adapts prompts, output cap
 and tool-result pruning to each task class. It reduces unproductive loops on larger work while keeping the
 user-selected model and tool presentation stable.
 
-> Status: `0.1.0-rc.1` initial standalone release candidate. DeepSeek Harness is still in developer preview. This
+> Status: `0.1.0-rc.2` release candidate. DeepSeek Harness is still in developer preview. This
 > plugin builds against its published `0.1.0-rc.6` package APIs; rerun the tests before each DSH upgrade.
 
 ## Attribution
@@ -67,16 +67,24 @@ Core principles:
 
 ## Installation
 
-The package name was unclaimed when checked on 2026-08-15; check it again immediately before publishing.
-
 ```sh
-pnpm add dsh-plugin-adaptive-agent-policy
+dsh plugin --profile web add dsh-plugin-adaptive-agent-policy@next
 ```
 
-Add one entry to a DSH Cordis composition that already provides `llm` and `tokenMeter`:
+The command adds the package to the `web` profile dependencies and
+`dsh.profile.bundles`; no `settings.yaml` or manual `cordis.patch.yml` edit is
+needed. Inspect the composition and start it with:
+
+```sh
+dsh --profile web --dump-config
+dsh web
+```
+
+For source development or a custom Cordis root configuration, add it directly:
 
 ```yaml
-- name: dsh-plugin-adaptive-agent-policy
+- id: adaptive-agent-policy
+  name: dsh-plugin-adaptive-agent-policy
   config: {}
 ```
 

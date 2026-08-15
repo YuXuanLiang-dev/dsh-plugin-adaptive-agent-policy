@@ -1,0 +1,7 @@
+# Installed as a profile bundle by `dsh plugin --profile <name> add ...`.
+# The base bundle already provides the llm and tokenMeter services required by
+# this plugin, so this layer only inserts the adaptive policy itself.
+- insert:
+    - id: adaptive-agent-policy
+      name: dsh-plugin-adaptive-agent-policy
+      config: {}

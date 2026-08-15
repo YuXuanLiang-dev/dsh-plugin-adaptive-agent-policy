@@ -5,7 +5,7 @@
 一个可独立发布的非官方 DeepSeek Harness 插件：根据任务类别动态控制提示词、输出上限、软硬步骤预算与
 工具结果裁剪，在保持用户所选模型和工具展示方式稳定的前提下，减少大型任务中的无效循环。
 
-> 状态：`0.1.0-rc.1` 首次独立发布候选。DeepSeek Harness 仍处于开发者预览阶段，插件以公开的
+> 状态：`0.1.0-rc.2` 发布候选。DeepSeek Harness 仍处于开发者预览阶段，插件以公开的
 > `0.1.0-rc.6` 包 API 构建；升级 DSH 时应先重新运行测试。
 
 ## 出处与声明
@@ -62,16 +62,23 @@ flowchart LR
 
 ## 安装
 
-包名在 2026-08-15 查询时尚未被 npm 占用；正式发布前应再次确认。
-
 ```sh
-pnpm add dsh-plugin-adaptive-agent-policy
+dsh plugin --profile web add dsh-plugin-adaptive-agent-policy@next
 ```
 
-在具有 `llm` 与 `tokenMeter` 服务的 DSH Cordis 配置中加入：
+安装命令会把包加入 `web` Profile 的依赖和 `dsh.profile.bundles`，无需修改
+`settings.yaml` 或手动编辑 `cordis.patch.yml`。检查组合结果后启动：
+
+```sh
+dsh --profile web --dump-config
+dsh web
+```
+
+从源码开发或使用自定义 Cordis 根配置时，也可以直接加入：
 
 ```yaml
-- name: dsh-plugin-adaptive-agent-policy
+- id: adaptive-agent-policy
+  name: dsh-plugin-adaptive-agent-policy
   config: {}
 ```
 
