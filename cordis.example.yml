@@ -1,0 +1,3 @@
+- name: '@deepseek-ai/dsh-token-meter'
+- name: dsh-plugin-adaptive-agent-policy
+  config: {}
