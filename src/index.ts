@@ -8,7 +8,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, deepFreeze } from '@deepseek-ai/dsh-llm'
+import { deepFreeze } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig, UserMessage } from '@deepseek-ai/dsh-llm'
 import AdaptiveToolResultPruner, {
   resolveConfig as resolvePruneConfig,
@@ -16,12 +16,35 @@ import AdaptiveToolResultPruner, {
 } from './pruner/index.ts'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-token-meter'
+import {
+  DEFAULT_RISK_ROUTER_CONFIG,
+  resolveRiskRouterConfig,
+  riskCheckpoint,
+  routeRisk,
+  type RiskRouteDecision,
+  type RiskRouterConfig,
+  type ResolvedRiskRouterConfig,
+} from './risk-router.ts'
+
+export {
+  DEFAULT_RISK_ROUTER_CONFIG,
+  resolveRiskRouterConfig,
+  riskCheckpoint,
+  routeRisk,
+  type RiskClass,
+  type RiskRouteDecision,
+  type RiskRouterConfig,
+  type RiskRouterInput,
+  type RiskRouteReason,
+  type ResolvedRiskRouterConfig,
+  type RoutedTaskClass,
+} from './risk-router.ts'
 
 /** Cordis plugin name used by loader diagnostics and model-visible message provenance. */
 export const name = 'adaptive-agent-policy'
 
 /** Services required for request-pressure measurement and routed-model capacity lookup. */
-export const inject = ['llm', 'tokenMeter']
+export const inject = ['llm', 'tokenMeter', 'systemPrompt']
 
 /** Stable task classes selected from the latest human request. */
 export type TaskClass = 'read' | 'small' | 'frontend' | 'large' | 'batch'
@@ -64,6 +87,8 @@ export interface Config {
   taskProfiles?: TaskProfileConfig[]
   /** Ordered moderate-to-critical progressive pruning levels. */
   pruneLevels?: PruneLevelConfig[]
+  /** Bounded deterministic controls for the one-time risk checkpoint. */
+  riskRouter?: RiskRouterConfig
 }
 
 /** Fully validated immutable configuration. */
@@ -72,6 +97,8 @@ export interface ResolvedConfig {
   readonly taskProfiles: readonly Readonly<TaskProfileConfig>[]
   /** Ordered moderate-to-critical pruning levels. */
   readonly pruneLevels: readonly Readonly<PruneLevelConfig>[]
+  /** Complete controls for the second-layer risk router. */
+  readonly riskRouter: ResolvedRiskRouterConfig
 }
 
 const TASK_CLASSES = ['read', 'small', 'frontend', 'large', 'batch'] as const
@@ -147,22 +174,29 @@ function prunePolicy(level: PruneLevelConfig): ToolResultPruneConfig {
 export const Config: z<Config> = z.object({
   taskProfiles: z.array(taskProfileSchema).default(DEFAULT_TASK_PROFILES),
   pruneLevels: z.array(pruneLevelSchema).default(DEFAULT_PRUNE_LEVELS),
+  riskRouter: z.object({
+    enabled: z.boolean().default(DEFAULT_RISK_ROUTER_CONFIG.enabled),
+    minimumScore: z.number().step(1).min(1).default(DEFAULT_RISK_ROUTER_CONFIG.minimumScore),
+    maxRequestChars: z.number().step(1).min(1).default(DEFAULT_RISK_ROUTER_CONFIG.maxRequestChars),
+    maxEvidenceChars: z.number().step(1).min(1).default(DEFAULT_RISK_ROUTER_CONFIG.maxEvidenceChars),
+    skipCovered: z.boolean().default(DEFAULT_RISK_ROUTER_CONFIG.skipCovered),
+  }).default(DEFAULT_RISK_ROUTER_CONFIG),
 })
 
 const POLICY_TEXT: Record<TaskClass, string> = {
   read: 'Treat this as a read-only investigation. Gather only the evidence needed to answer; do not modify files, and stop once the cause or conclusion is supported.',
-  small: 'Treat this as a focused change. Inspect the target and immediate conventions, implement the smallest complete fix, and run narrow checks. Before finishing, execute one pairwise counterexample that combines a neutral or empty value with an extreme or failure value; individually valid boundaries can interact. Do not claim it was checked without observed output.',
-  frontend: 'Treat this as a frontend implementation. Establish a deliberate visual direction, implement early, and run existing checks. Keep mobile overflow, hierarchy, primary interaction, and accessibility as acceptance criteria; do not build new verification infrastructure unless the user requested it.',
-  large: 'Treat this as a cross-cutting change. Map only the relevant architecture, callers, data flow, and tests, then implement and verify it. Exercise one pairwise state transition combining failure, abort, or retry with ordering, cleanup, or concurrency before finishing.',
+  small: 'Treat this as a focused change. Inspect the target and immediate conventions, implement the smallest complete fix, and use existing narrow checks for the changed behavior.',
+  frontend: 'Treat this as a frontend implementation. Establish a deliberate visual direction, implement early, and verify the user-visible behavior with existing project facilities.',
+  large: 'Treat this as a cross-cutting change. Map only the relevant architecture, callers, data flow, and tests, then implement and verify the affected contracts.',
   batch: 'Treat this as a batch-oriented task. Group independent discovery and transformations, use bounded outputs, preserve ordering where operations depend on each other, and verify representative results plus the aggregate outcome.',
 }
 
 const CHECKPOINT_TEXT: Record<TaskClass, string> = {
   read: 'Stop exploring. Answer from the strongest evidence already gathered, or name the exact missing evidence.',
-  small: 'Do not broaden scope. Run one executable pairwise counterexample combining a neutral or empty value with an extreme or failure value, fix only if it fails, then finish. A verbal or algebraic check does not count.',
-  frontend: 'Do not build preview or browser infrastructure. Use at most one batched source-inspection step, one corrective edit step, and one existing-check step. If a browser command is already configured, check 390px overflow and the primary interaction once; otherwise inspect those risks in that single batch, then finish.',
-  large: 'Stop broad exploration. Run one executable pairwise transition absent from visible tests: combine failure, abort, or retry with ordering, cleanup, or concurrency. Fix from evidence if needed, then finish.',
-  batch: 'Stop broad exploration. Verify representative transformed cases and the aggregate count, then finish or report the exact blocker.',
+  small: 'Converge now. Do not invent a new verification path; use an existing narrow check only if the changed behavior is still unverified, then finish.',
+  frontend: 'Converge now. Do not create preview or browser infrastructure; use an existing project check only if the changed user-visible behavior is still unverified, then finish.',
+  large: 'Stop broad exploration. Use an existing targeted check only for an affected contract that remains unverified, then finish or report the exact blocker.',
+  batch: 'Stop broad exploration. Use existing representative and aggregate evidence; only run a remaining project check if the batch invariant is still unverified, then finish.',
 }
 
 const READ_PATTERN = /(?:分析|解释|审查|评估|比较|为什么|原因|诊断|看看|review|analy[sz]e|explain|diagnos|compare|audit|investigate)/i
@@ -193,9 +227,8 @@ function matchesAny(text: string, patterns: readonly RegExp[]): boolean {
 
 interface AgentState {
   taskClass: TaskClass
-  announced: TaskClass | undefined
-  checkpointTurns: Set<number>
-  finalizationTurns: Set<number>
+  requestText: string
+  routedRisk: { turn: number; decision: RiskRouteDecision } | undefined
   lastPrune: string | undefined
 }
 
@@ -264,7 +297,8 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     previousRatio = level.atPressureRatio
     previousThreshold = level.thresholdChars
   }
-  return deepFreeze({ taskProfiles: profiles, pruneLevels: levels })
+  const riskRouter = resolveRiskRouterConfig(config.riskRouter)
+  return deepFreeze({ taskProfiles: profiles, pruneLevels: levels, riskRouter })
 }
 
 function assertPositiveInteger(name: string, value: number): void {
@@ -282,53 +316,11 @@ function messageText(message: UserMessage): string {
     .join('\n')
 }
 
-function latestHumanTask(agent: Agent): TaskClass | undefined {
+function latestHumanRequest(agent: Agent): UserMessage | undefined {
   const event = agent.session.events.findLast(candidate => (
     candidate.type === 'user/message' && candidate.data.source.kind === 'user'
   ))
-  return event?.type === 'user/message' ? classifyTask(messageText(event.data)) : undefined
-}
-
-function latestAnnouncement(agent: Agent): TaskClass | undefined {
-  const event = agent.session.events.findLast(candidate => (
-    candidate.type === 'user/message'
-    && candidate.data.source.kind === 'plugin'
-    && candidate.data.source.plugin === name
-    && candidate.data.source.form === 'notice'
-    && candidate.data.source.summary.startsWith('task policy: ')
-  ))
-  if (event?.type !== 'user/message'
-    || event.data.source.kind !== 'plugin'
-    || event.data.source.form !== 'notice') return undefined
-  const summary = event.data.source.summary
-  const taskClass = summary.slice('task policy: '.length)
-  return TASK_CLASSES.find(candidate => candidate === taskClass)
-}
-
-function priorCheckpointTurns(agent: Agent): Set<number> {
-  const turns = new Set<number>()
-  for (const event of agent.session.events) {
-    if (event.type !== 'user/message'
-      || event.data.source.kind !== 'plugin'
-      || event.data.source.plugin !== name
-      || event.data.source.form !== 'notice') continue
-    const turn = /^task checkpoint: [a-z]+; turn (\d+)$/.exec(event.data.source.summary)?.[1]
-    if (turn !== undefined) turns.add(Number(turn))
-  }
-  return turns
-}
-
-function priorFinalizationTurns(agent: Agent): Set<number> {
-  const turns = new Set<number>()
-  for (const event of agent.session.events) {
-    if (event.type !== 'user/message'
-      || event.data.source.kind !== 'plugin'
-      || event.data.source.plugin !== name
-      || event.data.source.form !== 'notice') continue
-    const turn = /^task finalization: [a-z]+; turn (\d+)$/.exec(event.data.source.summary)?.[1]
-    if (turn !== undefined) turns.add(Number(turn))
-  }
-  return turns
+  return event?.type === 'user/message' ? event.data : undefined
 }
 
 function profileFor(config: ResolvedConfig, taskClass: TaskClass): Readonly<TaskProfileConfig> {
@@ -338,49 +330,32 @@ function profileFor(config: ResolvedConfig, taskClass: TaskClass): Readonly<Task
   return profile
 }
 
-function policyMessage(taskClass: TaskClass): UserMessage {
-  return createUserMessage({
-    content: [{ type: 'text', text: `<task_policy class="${taskClass}">\n${POLICY_TEXT[taskClass]}\n</task_policy>` }],
-    source: {
-      kind: 'plugin',
-      plugin: name,
-      form: 'notice',
-      summary: `task policy: ${taskClass}`,
-    },
-  })
+function checkpointText(taskClass: TaskClass, decision: RiskRouteDecision): string {
+  const checkpoint = taskClass === 'read'
+    ? CHECKPOINT_TEXT.read
+    : decision.risk !== undefined
+      ? `Converge now. ${riskCheckpoint(decision.risk)} Fix only from observed evidence if needed, then finish.`
+      : decision.reason === 'already-covered'
+        ? 'Converge now. Recent output already covers the highest-confidence risk; do not invent another verification path. Finish from the evidence.'
+        : CHECKPOINT_TEXT[taskClass]
+  return `<task_checkpoint class="${taskClass}" risk="${decision.risk ?? 'none'}">\n${checkpoint}\n</task_checkpoint>`
 }
 
-function checkpointMessage(taskClass: TaskClass, turn: number): UserMessage {
-  return createUserMessage({
-    content: [{
-      type: 'text',
-      text: `<task_checkpoint class="${taskClass}">\n${CHECKPOINT_TEXT[taskClass]}\n</task_checkpoint>`,
-    }],
-    source: {
-      kind: 'plugin',
-      plugin: name,
-      form: 'notice',
-      summary: `task checkpoint: ${taskClass}; turn ${turn}`,
-    },
-  })
-}
-
-function finalizationMessage(taskClass: TaskClass, turn: number): UserMessage {
-  return createUserMessage({
-    content: [{
-      type: 'text',
-      text: `<task_finalization class="${taskClass}">\n`
-        + 'The task step budget is exhausted and tools are unavailable for this step. Do not request or call tools. '
-        + 'Give the best final answer supported by completed work, and state any exact remaining work or blocker.\n'
-        + '</task_finalization>',
-    }],
-    source: {
-      kind: 'plugin',
-      plugin: name,
-      form: 'notice',
-      summary: `task finalization: ${taskClass}; turn ${turn}`,
-    },
-  })
+function adaptivePhaseText(
+  taskClass: TaskClass,
+  phase: 'normal' | 'checkpoint' | 'finalization',
+  decision?: RiskRouteDecision,
+): string {
+  if (phase === 'normal') return `<task_policy class="${taskClass}">\n${POLICY_TEXT[taskClass]}\n</task_policy>`
+  if (phase === 'checkpoint' && decision !== undefined) return checkpointText(taskClass, decision)
+  if (phase === 'finalization') {
+    return `<task_finalization class="${taskClass}">\n`
+      + 'The task step budget is exhausted and tools are unavailable for this step. Do not request or call tools. '
+      + 'Give the best final answer supported by completed work, and state any exact remaining work or blocker.\n'
+      + '</task_finalization>'
+  }
+  /* v8 ignore next -- every checkpoint assembly supplies its frozen turn decision. */
+  return CHECKPOINT_TEXT[taskClass]
 }
 
 function proposedPosition(agent: Agent): { turn: number; step: number } | undefined {
@@ -403,6 +378,48 @@ function routedTarget(agent: Agent): Pick<LlmCallConfig, 'provider' | 'model'> |
   return { provider: agent.options.provider, model: agent.options.model }
 }
 
+/** Collect text from only the newest few tool results, bounded before routing. */
+function recentToolEvidence(agent: Agent, maximum: number): string {
+  const pieces: string[] = []
+  let remaining = maximum
+  let inspectedResults = 0
+  for (let index = agent.session.events.length - 1; index >= 0 && remaining > 0 && inspectedResults < 8; index -= 1) {
+    const event = agent.session.events[index]
+    if (event?.type !== 'tool/result') continue
+    inspectedResults += 1
+    const block = event.data.message.content[0]
+    const raw = nestedText(block.content, remaining)
+    if (raw.length === 0) continue
+    const prefix = block.isError ? '[tool error]\n' : '[tool result]\n'
+    const available = Math.max(0, remaining - prefix.length)
+    const piece = `${prefix}${boundEvidencePiece(raw, available)}`
+    pieces.push(piece)
+    remaining -= piece.length + 1
+  }
+  return pieces.join('\n')
+}
+
+function nestedText(blocks: readonly unknown[], maximum: number): string {
+  const pieces: string[] = []
+  let remaining = maximum
+  for (const value of blocks) {
+    if (remaining <= 0 || typeof value !== 'object' || value === null) continue
+    const block = value as { type?: unknown; text?: unknown }
+    if (block.type !== 'text' || typeof block.text !== 'string') continue
+    const piece = block.text.slice(0, remaining)
+    pieces.push(piece)
+    remaining -= piece.length + 1
+  }
+  return pieces.join('\n')
+}
+
+function boundEvidencePiece(text: string, maximum: number): string {
+  if (text.length <= maximum) return text
+  if (maximum <= 3) return text.slice(0, maximum)
+  const tail = Math.floor(maximum / 4)
+  return `${text.slice(0, maximum - tail - 3)}\n…\n${text.slice(-tail)}`
+}
+
 /**
  * Install deterministic task classification, request caps, soft convergence checkpoints, and adaptive pruning.
  * @param ctx - Cordis context carrying LLM and token-meter services.
@@ -419,11 +436,11 @@ export async function apply(ctx: Context, rawConfig: Config = {}): Promise<void>
   const stateFor = (agent: Agent): AgentState => {
     const existing = states.get(agent)
     if (existing !== undefined) return existing
+    const request = latestHumanRequest(agent)
     const state: AgentState = {
-      taskClass: latestHumanTask(agent) ?? 'small',
-      announced: latestAnnouncement(agent),
-      checkpointTurns: priorCheckpointTurns(agent),
-      finalizationTurns: priorFinalizationTurns(agent),
+      taskClass: request === undefined ? 'small' : classifyTask(messageText(request)),
+      requestText: request === undefined ? '' : messageText(request),
+      routedRisk: undefined,
       lastPrune: undefined,
     }
     states.set(agent, state)
@@ -433,7 +450,8 @@ export async function apply(ctx: Context, rawConfig: Config = {}): Promise<void>
   ctx.on('agent/inbox/inserted', ({ agent, message }) => {
     if (message.source.kind !== 'user') return
     const state = stateFor(agent)
-    state.taskClass = classifyTask(messageText(message))
+    state.requestText = messageText(message)
+    state.taskClass = classifyTask(state.requestText)
   })
 
   ctx.on('agent/request', async ({ agent }, next): Promise<LlmCallConfig> => {
@@ -452,14 +470,51 @@ export async function apply(ctx: Context, rawConfig: Config = {}): Promise<void>
     if (position === undefined) return assembled
     const state = stateFor(agent)
     const profile = profileFor(config, state.taskClass)
-    if (position.step < profile.hardStepBudget || assembled.tools.length === 0) return assembled
-    return { ...assembled, tools: [] }
+    let phase: 'normal' | 'checkpoint' | 'finalization' = 'normal'
+    let decision: RiskRouteDecision | undefined
+    if (position.step >= profile.hardStepBudget) {
+      phase = 'finalization'
+    } else if (position.step >= profile.softStepBudget) {
+      phase = 'checkpoint'
+      if (state.routedRisk?.turn !== position.turn) {
+        state.routedRisk = {
+          turn: position.turn,
+          decision: routeRisk({
+            taskClass: state.taskClass,
+            requestText: state.requestText,
+            recentEvidence: recentToolEvidence(agent, config.riskRouter.maxEvidenceChars),
+          }, config.riskRouter),
+        }
+        const routed = state.routedRisk.decision
+        const detail = `adaptive-agent-policy: risk checkpoint ${routed.risk ?? 'none'} `
+          + `(reason ${routed.reason}, score ${routed.score})`
+        if (routed.risk === undefined) ctx.logger.debug(detail)
+        else ctx.logger.info(detail)
+      }
+      decision = state.routedRisk.decision
+    }
+    // A system section is rebuilt for the current request and never becomes a
+    // session message. This keeps one compact phase instruction without the
+    // cumulative input growth caused by appending runtime-context snapshots.
+    const adaptiveSection = {
+      name: 'adaptive-agent-policy:state',
+      text: adaptivePhaseText(state.taskClass, phase, decision),
+    }
+    const sections = assembled.sections.filter(candidate => candidate.name !== adaptiveSection.name)
+    return {
+      ...assembled,
+      sections: [...sections, adaptiveSection],
+      tools: phase === 'finalization' ? [] : assembled.tools,
+    }
   })
 
   ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next): Promise<PreStepDecision> => {
     const state = stateFor(agent)
     const newestHuman = messages.findLast(message => message.source.kind === 'user')
-    if (newestHuman !== undefined) state.taskClass = classifyTask(messageText(newestHuman))
+    if (newestHuman !== undefined) {
+      state.requestText = messageText(newestHuman)
+      state.taskClass = classifyTask(state.requestText)
+    }
     const downstream = await next()
     if (downstream.kind === 'reject' || signal.aborted) return downstream
 
@@ -509,21 +564,6 @@ export async function apply(ctx: Context, rawConfig: Config = {}): Promise<void>
       }
     }
 
-    const profile = profileFor(config, state.taskClass)
-    const finalizing = step >= profile.hardStepBudget && !state.finalizationTurns.has(turn)
-    const checkpoint = step >= profile.softStepBudget && !state.checkpointTurns.has(turn)
-    const announce = state.announced !== state.taskClass
-    if (!announce && !checkpoint && !finalizing) return downstream
-    state.announced = state.taskClass
-    if (checkpoint) state.checkpointTurns.add(turn)
-    if (finalizing) state.finalizationTurns.add(turn)
-    const policyMessages: UserMessage[] = []
-    if (announce) policyMessages.push(policyMessage(state.taskClass))
-    if (checkpoint) policyMessages.push(checkpointMessage(state.taskClass, turn))
-    if (finalizing) policyMessages.push(finalizationMessage(state.taskClass, turn))
-    return {
-      kind: 'enter',
-      messages: [...policyMessages, ...downstream.messages],
-    }
+    return downstream
   })
 }

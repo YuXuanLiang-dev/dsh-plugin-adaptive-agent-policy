@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import * as AdaptivePolicy from '../src/index.ts'
 import {
   classifyTask,
@@ -31,6 +34,13 @@ describe('adaptive policy', () => {
       .toEqual(['read', 'small', 'frontend', 'large', 'batch'])
     expect(config.pruneLevels.map(level => level.name))
       .toEqual(['moderate', 'tight', 'critical'])
+    expect(config.riskRouter).toEqual({
+      enabled: true,
+      minimumScore: 4,
+      maxRequestChars: 4_096,
+      maxEvidenceChars: 8_192,
+      skipCovered: true,
+    })
     expect(Object.isFrozen(config)).toBe(true)
   })
 
@@ -67,9 +77,67 @@ describe('adaptive policy', () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(TokenMeter)
+    await ctx.plugin(SystemPrompt)
 
     await ctx.plugin(AdaptivePolicy)
 
     expect(ctx.get('adaptiveToolResultPruner')).toBeInstanceOf(AdaptiveToolResultPruner)
+  })
+
+  it('keeps one non-persistent system section stable within each policy phase', async () => {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(TokenMeter)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AdaptivePolicy)
+
+    const request = createUserMessage({
+      content: [{ type: 'text', text: '修复重试逻辑并保证幂等，避免重复请求' }],
+      source: { kind: 'user' },
+    })
+    const events: Array<Record<string, unknown>> = [
+      { type: 'user/message', data: request },
+      { type: 'turn/start', data: { turn: 1 } },
+    ]
+    const agent = { session: { events }, options: {} } as unknown as Agent
+    const policyAssembly = async () => ctx.systemPrompt.assemble({ agent })
+    const policyText = async () => (await policyAssembly())
+      .sections.find(entry => entry.name === 'adaptive-agent-policy:state')?.text
+    const systemText = async () => renderPrompt(await policyAssembly())
+
+    const normal = await policyText()
+    const normalSystem = await systemText()
+    expect(normal).toContain('<task_policy class="small">')
+    expect(normal).not.toContain('<task_checkpoint')
+    expect(await policyText()).toBe(normal)
+    expect(await systemText()).toBe(normalSystem)
+
+    for (let step = 1; step <= 4; step += 1) events.push({ type: 'step/start', data: { turn: 1, step } })
+    const checkpoint = await policyText()
+    const checkpointSystem = await systemText()
+    expect(checkpoint).toContain('<task_checkpoint class="small" risk="retry">')
+    expect(checkpoint).not.toContain('<task_policy')
+    expect(await policyText()).toBe(checkpoint)
+    expect(await systemText()).toBe(checkpointSystem)
+    expect(checkpointSystem).not.toBe(normalSystem)
+
+    for (let step = 5; step <= 8; step += 1) events.push({ type: 'step/start', data: { turn: 1, step } })
+    const finalization = await policyText()
+    const finalizationSystem = await systemText()
+    expect(finalization).toContain('<task_finalization class="small">')
+    expect(finalization).not.toContain('<task_checkpoint')
+    expect(finalization).not.toContain('<task_policy')
+    expect(await systemText()).toBe(finalizationSystem)
+    expect(finalizationSystem).not.toBe(checkpointSystem)
+
+    events.push({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    events.push({ type: 'turn/start', data: { turn: 2 } })
+    expect(await policyText()).toBe(normal)
+    const finalAssembly = await policyAssembly()
+    expect(finalAssembly.contexts).not.toContainEqual(expect.objectContaining({
+      name: 'adaptive-agent-policy:state',
+    }))
+    expect(JSON.stringify(events)).not.toMatch(/task_(?:policy|checkpoint|finalization)/)
+    expect(events).toHaveLength(12)
   })
 })

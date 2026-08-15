@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-adaptive-agent-policy",
-  "version": "0.1.0-rc.2",
-  "description": "Adaptive task routing, loop budgets, and progressive tool-result pruning for DeepSeek Harness",
+  "version": "0.1.0-rc.3",
+  "description": "Adaptive task and risk routing, loop budgets, and progressive tool-result pruning for DeepSeek Harness",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -17,6 +17,7 @@
     "deepseek-harness",
     "dsh-plugin",
     "agent",
+    "risk-routing",
     "prompt",
     "compaction"
   ],
